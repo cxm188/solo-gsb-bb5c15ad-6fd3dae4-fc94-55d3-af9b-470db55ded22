@@ -96,6 +96,7 @@
 │   ├── __init__.py
 │   ├── greenwave.py      # 纯算法：周期展开 + 区间求交，无逐秒试探
 │   ├── schemas.py        # Pydantic 请求/响应模型与输入校验
+│   ├── observability.py  # request_id 上下文、统一错误响应、结构化访问日志
 │   └── main.py           # FastAPI 入口与路由
 ├── tests/                # pytest 测试（含随机用例的逐秒/逐 offset 对照）
 ├── conftest.py
@@ -166,7 +167,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `APP_PORT` | `8000` | **宿主机**暴露端口（容器内固定监听 8000）。8000 被占用时：`cp .env.example .env` 后改成如 `APP_PORT=8080`，再重新 `docker compose up -d` |
-| `LOG_LEVEL` | `info` | uvicorn 日志级别（`critical`/`error`/`warning`/`info`/`debug`） |
+| `LOG_LEVEL` | `info` | 日志级别（`critical`/`error`/`warning`/`info`/`debug`）：同时作用于 uvicorn 启动日志与本服务的应用日志（结构化访问日志与错误日志，见[请求追踪与结构化日志](#请求追踪request_id与结构化日志)） |
 
 ## 时间与相位语义（重要约定）
 
@@ -1619,15 +1620,78 @@ curl -s -X POST http://localhost:8000/api/green-wave/conflict-audit \
 
 ## 输入校验与错误
 
-无效周期、相位偏移、绿灯端点、行驶时间（含 `travel_max < travel` 或
-`travel_max > 86400`），或路口数、发车范围长度越界时返回
-`422 Unprocessable Entity`，响应体含中文原因，例如：
+### 统一错误响应格式
+
+所有错误响应——包括参数校验失败（422）、业务 HTTP 错误（如 404、405、跨字段
+校验 422）以及服务端未捕获异常（500）——都使用统一的 JSON 结构，并在响应头
+`X-Request-ID` 回传本次请求的唯一 ID（见
+[请求追踪](#请求追踪request_id与结构化日志)）：
 
 ```json
-{ "detail": ["travel_max 不得小于 travel（路口 中山路）"] }
+{
+  "request_id": "8d22854c-58ef-4aae-83e9-c47c0bc283fe",
+  "error": {
+    "code": "validation_error",
+    "message": "请求参数校验失败",
+    "details": ["travel_max 不得小于 travel（路口 中山路）"]
+  }
+}
 ```
 
-字段类型错误、缺失字段也由 Pydantic 统一返回 422。
+| 字段 | 说明 |
+| --- | --- |
+| `request_id` | 本次请求的唯一 ID（UUID4），与响应头 `X-Request-ID` 完全一致，可用于报障排障 |
+| `error.code` | 稳定的机器可读错误码（见下表），调用方应据此分支处理 |
+| `error.message` | 面向人的中文可读信息，通用、不随具体输入变化 |
+| `error.details` | 可选的具体原因：Pydantic 字段级错误为 `[{field, message, type}]` 列表；跨字段校验错误为中文字符串列表 |
+
+错误码与 HTTP 状态码对应关系：
+
+| HTTP | `error.code` | 触发场景 |
+| --- | --- | --- |
+| 400 | `bad_request` | 请求格式错误 |
+| 404 | `not_found` | 路径不存在 |
+| 405 | `method_not_allowed` | HTTP 方法不允许（如对 `/health` 发 DELETE） |
+| 422 | `validation_error` | 参数校验失败：字段级约束（Pydantic）与跨字段业务校验 |
+| 500 | `internal_error` | 服务端未捕获异常；**响应体只含通用提示，不包含任何内部异常文本或堆栈** |
+| 其他 4xx | `http_error` | 其余 4xx 响应 |
+
+> 正常业务响应（2xx）的响应体保持原有格式不变（数组、对象或 `null`），统一错误
+> 信封只出现在错误响应中。下文各接口小节给出的 `{"detail": [...]}` 仅展示旧版
+> 错误内容，实际响应中的中文原因位于 `error.details`。
+
+### 各接口的校验规则
+
+无效周期、相位偏移、绿灯端点、行驶时间（含 `travel_max < travel` 或
+`travel_max > 86400`），或路口数、发车范围长度越界时返回
+`422 Unprocessable Entity`，`error.details` 含中文原因，例如：
+
+```json
+{
+  "request_id": "8d22854c-58ef-4aae-83e9-c47c0bc283fe",
+  "error": {
+    "code": "validation_error",
+    "message": "请求参数校验失败",
+    "details": ["travel_max 不得小于 travel（路口 中山路）"]
+  }
+}
+```
+
+字段类型错误、缺失字段同样返回 422，此时 `details` 逐项给出字段定位（如
+`intersections[0].cycle`）与 Pydantic 原因：
+
+```json
+{
+  "request_id": "26da8048-c70d-4d7a-aa5e-63084b481660",
+  "error": {
+    "code": "validation_error",
+    "message": "请求参数校验失败",
+    "details": [
+      {"field": "intersections", "message": "Field required", "type": "missing"}
+    ]
+  }
+}
+```
 
 `/api/green-wave/offset-diagnostics` 同样在以下情况返回 422：
 
@@ -1641,13 +1705,13 @@ curl -s -X POST http://localhost:8000/api/green-wave/conflict-audit \
 `adjustable_index < 路口数`，否则返回 422：
 
 ```json
-{ "detail": ["adjustable_index 必须满足 0 <= adjustable_index < 路口数"] }
+{ "error": { "code": "validation_error", "message": "请求参数校验失败", "details": ["adjustable_index 必须满足 0 <= adjustable_index < 路口数"] } }
 ```
 
 例如绿灯终点越界：
 
 ```json
-{ "detail": ["green_end 必须满足 0 <= green_end < cycle"] }
+{ "error": { "code": "validation_error", "message": "请求参数校验失败", "details": ["green_end 必须满足 0 <= green_end < cycle"] } }
 ```
 
 `/api/green-wave/convoy-starts` 同样沿用绿波窗口接口的**全部** 422 校验，并额外
@@ -1655,7 +1719,7 @@ curl -s -X POST http://localhost:8000/api/green-wave/conflict-audit \
 `(vehicle_count-1)×headway` **小于**发车范围长度（否则首车不存在任何可行时刻）：
 
 ```json
-{ "detail": ["(vehicle_count - 1) × headway 必须小于发车范围长度"] }
+{ "error": { "code": "validation_error", "message": "请求参数校验失败", "details": ["(vehicle_count - 1) × headway 必须小于发车范围长度"] } }
 ```
 
 `/api/green-wave/plan-switch-windows` 沿用绿波窗口接口的**全部** 422 校验（旧计划
@@ -1666,7 +1730,7 @@ curl -s -X POST http://localhost:8000/api/green-wave/conflict-audit \
 范围外，不构成错误）：
 
 ```json
-{ "detail": ["next_plan.offset 必须满足 0 <= offset < cycle（路口 cycle=60）"] }
+{ "error": { "code": "validation_error", "message": "请求参数校验失败", "details": ["next_plan.offset 必须满足 0 <= offset < cycle（路口 cycle=60）"] } }
 ```
 
 `/api/green-wave/timetable-reschedule` 沿用绿波窗口接口的**全部** 422 校验（路口
@@ -1682,11 +1746,11 @@ curl -s -X POST http://localhost:8000/api/green-wave/conflict-audit \
 HTTP 状态码为 200、响应体为 `null`（不会返回 422）。例如：
 
 ```json
-{ "detail": ["original_departures 必须按原时刻严格递增（第 0 班 10 之后第 1 班 10 未严格增大）"] }
+{ "error": { "code": "validation_error", "message": "请求参数校验失败", "details": ["original_departures 必须按原时刻严格递增（第 0 班 10 之后第 1 班 10 未严格增大）"] } }
 ```
 
 ```json
-{ "detail": ["original_departures[0] = 5 必须落在发车范围 [10, 60) 内"] }
+{ "error": { "code": "validation_error", "message": "请求参数校验失败", "details": ["original_departures[0] = 5 必须落在发车范围 [10, 60) 内"] } }
 ```
 
 `/api/green-wave/earliest-route` 的 422 校验：
@@ -1703,7 +1767,7 @@ HTTP 状态码为 200、响应体为 `null`（不会返回 422）。例如：
 （不会返回 422）。例如：
 
 ```json
-{ "detail": ["roads[0].to 必须满足 0 <= to < 路口数（当前 3 个）"] }
+{ "error": { "code": "validation_error", "message": "请求参数校验失败", "details": ["roads[0].to 必须满足 0 <= to < 路口数（当前 3 个）"] } }
 ```
 
 `/api/green-wave/queue-forecast` 的 422 校验：
@@ -1717,7 +1781,7 @@ HTTP 状态码为 200、响应体为 `null`（不会返回 422）。例如：
   （**范围外到达**为跨字段 422，错误信息带批次下标与时刻）。
 
 ```json
-{ "detail": ["arrivals[0].time = 60 必须落在预测范围 [0, 60) 内"] }
+{ "error": { "code": "validation_error", "message": "请求参数校验失败", "details": ["arrivals[0].time = 60 必须落在预测范围 [0, 60) 内"] } }
 ```
 
 `/api/green-wave/min-discharge` 沿用排队预测接口的信号参数、预测范围与到达时刻 422
@@ -1730,7 +1794,7 @@ deadline 合法但绿灯容量不足（含范围内全程红灯）属于业务�
 响应体为 `null`，不会返回 422。
 
 ```json
-{ "detail": ["arrivals[0].deadline = 60 必须满足 time <= deadline < forecast_to（范围终点 60 不含）"] }
+{ "error": { "code": "validation_error", "message": "请求参数校验失败", "details": ["arrivals[0].deadline = 60 必须满足 time <= deadline < forecast_to（范围终点 60 不含）"] } }
 ```
 
 `/api/green-wave/conflict-audit` 的 422 校验：
@@ -1745,8 +1809,60 @@ deadline 合法但绿灯容量不足（含范围内全程红灯）属于业务�
 - `pairs[].clearance ∈ [0, 300]`（字段级 422）。
 
 ```json
-{ "detail": ["pairs[2] 重复的互斥车流对（车流 0 与 1）"] }
+{ "error": { "code": "validation_error", "message": "请求参数校验失败", "details": ["pairs[2] 重复的互斥车流对（车流 0 与 1）"] } }
 ```
+
+## 请求追踪（request_id）与结构化日志
+
+### request_id 与 X-Request-ID
+
+服务为**每个 HTTP 请求**生成一个唯一的 `request_id`（UUID4 字符串）：
+
+- 该 ID 写入请求局部上下文（基于 Python `contextvars`），路由处理与异常处理读到的
+  都是同一 ID；上下文随请求隔离，**并发请求互不串号**。如需在业务代码中获取当前
+  请求 ID，可调用 `app.observability.get_request_id()`；
+- 每个响应（含成功、4xx、500）都通过响应头 **`X-Request-ID`** 原样回传该 ID；
+- 所有错误响应体的顶层 `request_id` 字段与该响应头一致，客户端报障时附上此 ID 即可
+  在服务端日志中定位完整调用链。
+
+### 错误时的行为
+
+- **参数校验错误**：请求体解析失败、字段缺失/类型错误/取值越界（Pydantic）以及
+  各接口 `validate_ranges()` 的跨字段业务校验，统一返回 HTTP 422 与
+  `validation_error` 错误体（格式见[统一错误响应格式](#统一错误响应格式)）；
+- **业务 HTTP 错误**：如 404 路径不存在、405 方法不允许，分别返回
+  `not_found` / `method_not_allowed`；
+- **未捕获异常**：统一兜底为 HTTP 500 与 `internal_error`，响应体**只含通用提示**，
+  不暴露任何内部异常文本或堆栈；异常类型、堆栈明细仅写入服务端错误日志（`error`
+  级别，带同一 `request_id`）。
+
+### 结构化访问日志
+
+每个请求结束时（**包括异常路径**）向标准输出写一行 JSON 访问日志（logger 名
+`app.access`），字段如下：
+
+| 字段 | 说明 |
+| --- | --- |
+| `timestamp` | UTC 时间，ISO 8601（毫秒精度，`Z` 结尾） |
+| `level` | 日志级别：2xx 为 `info`、4xx 为 `warning`、5xx 为 `error` |
+| `logger` | 记录器名，访问日志固定为 `app.access` |
+| `message` | 固定文案 `request completed` |
+| `request_id` | 本次请求的唯一 ID，与响应头 / 错误体中的 ID 一致 |
+| `method` | HTTP 方法（如 `GET`、`POST`） |
+| `path` | 请求路径（不含 query string） |
+| `status_code` | 最终响应状态码（异常路径为实际返回的状态码，如 500） |
+| `duration_ms` | 请求耗时，毫秒（浮点，3 位小数） |
+
+示例：
+
+```json
+{"timestamp": "2026-09-26T00:26:54.079Z", "level": "warning", "logger": "app.access", "message": "request completed", "request_id": "26da8048-c70d-4d7a-aa5e-63084b481660", "method": "POST", "path": "/api/green-wave/windows", "status_code": 422, "duration_ms": 3.49}
+```
+
+未捕获异常时，除上述 500 访问日志外，另有一条 `app.error` 错误日志（`error`
+级别），携带同样的 `request_id` 与完整异常堆栈（`exception` 字段）。容器环境下
+用 `docker compose logs -f` 即可同时看到 uvicorn 启动日志与上述 JSON 应用日志；
+日志级别由环境变量 `LOG_LEVEL` 控制（默认 `info`）。
 
 ## 算法说明（区间运算，不逐秒试探）
 

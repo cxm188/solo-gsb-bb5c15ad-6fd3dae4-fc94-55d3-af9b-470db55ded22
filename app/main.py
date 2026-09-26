@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from fastapi import FastAPI
 
+from .observability import install_observability
 from .greenwave import (
     compute_conflict_audit,
     compute_convoy_starts,
@@ -116,8 +117,11 @@ app = FastAPI(
         "与跨零点区间，两股都已红灯的尾部交叠不计），逐对返回按时间升序"
         "合并的全部极大半开危险区间，安全的车流对返回空数组。"
     ),
-    version="1.10.0",
+    version="1.11.0",
 )
+
+# request_id 中间件、统一错误响应（422/HTTP/500）与结构化访问日志
+install_observability(app)
 
 
 def _intersection_payload(item) -> dict:

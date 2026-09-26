@@ -9,6 +9,8 @@ services:
     environment:
       # 如需调整日志级别等可在此扩展
       UVICORN_LOG_LEVEL: "${LOG_LEVEL:-info}"
+      # 应用结构化访问日志 / 错误日志的级别（observability 模块读取）
+      LOG_LEVEL: "${LOG_LEVEL:-info}"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
