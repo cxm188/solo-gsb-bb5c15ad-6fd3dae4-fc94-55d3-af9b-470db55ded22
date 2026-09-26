@@ -14,5 +14,7 @@ COPY app ./app
 
 EXPOSE 8000
 
-# 容器内固定监听 8000；宿主机端口通过 compose 的 APP_PORT 映射
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# 容器内固定监听 8000；宿主机端口通过 compose 的 APP_PORT 映射。
+# --no-access-log：每请求的访问日志由应用以结构化 JSON（含 request_id）输出，
+# 关闭 uvicorn 默认访问日志，避免同一请求两条访问记录。
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]

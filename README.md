@@ -94,12 +94,16 @@
 .
 ├── app/
 │   ├── __init__.py
-│   ├── greenwave.py      # 纯算法：周期展开 + 区间求交，无逐秒试探
-│   ├── schemas.py        # Pydantic 请求/响应模型与输入校验
-│   └── main.py           # FastAPI 入口与路由
-├── tests/                # pytest 测试（含随机用例的逐秒/逐 offset 对照）
+│   ├── greenwave.py         # 纯算法：周期展开 + 区间求交，无逐秒试探
+│   ├── schemas.py           # Pydantic 请求/响应模型与输入校验
+│   ├── request_context.py   # 请求局部上下文（ContextVar 存取 request_id）
+│   ├── errors.py            # 三类错误的统一 JSON 错误处理器
+│   ├── middleware.py        # request_id 注入、X-Request-ID、结构化访问日志、500 兜底
+│   └── main.py              # FastAPI 入口与路由
+├── tests/                   # pytest 测试（含随机用例的逐秒/逐 offset 对照）
 ├── conftest.py
-├── requirements.txt
+├── requirements.txt         # 生产依赖（Docker 镜像安装）
+├── requirements-dev.txt     # 本地测试额外依赖（pytest、httpx）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── .env.example
@@ -135,8 +139,12 @@ docker compose down
 
 ```bash
 pip install -r requirements.txt
-uvicorn app.main:app --host 0.0.0.0 --port 8000
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --no-access-log
 ```
+
+`--no-access-log` 用于关闭 uvicorn 默认的纯文本访问日志：每请求的访问记录
+已由应用以结构化 JSON（含 request_id）输出，避免同一请求打印两条访问日志；
+uvicorn 的启动与错误日志不受影响。
 
 同样通过 <http://localhost:8000/> 访问。
 
@@ -166,7 +174,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `APP_PORT` | `8000` | **宿主机**暴露端口（容器内固定监听 8000）。8000 被占用时：`cp .env.example .env` 后改成如 `APP_PORT=8080`，再重新 `docker compose up -d` |
-| `LOG_LEVEL` | `info` | uvicorn 日志级别（`critical`/`error`/`warning`/`info`/`debug`） |
+| `LOG_LEVEL` | `info` | 日志级别（`critical`/`error`/`warning`/`info`/`debug`）；同时作用于 uvicorn 与本服务的结构化访问日志（5xx 始终按 `error` 输出，不受此级别影响地进入 error 通道） |
 
 ## 时间与相位语义（重要约定）
 
@@ -1617,7 +1625,146 @@ curl -s -X POST http://localhost:8000/api/green-wave/conflict-audit \
 逐整数秒（前缀和判定"绿灯结束尚不足 c 秒"）暴力参考实现的逐项对照，以及全天范围、
 300 秒清空间隔的压力用例。
 
+## 请求 ID、统一错误响应与访问日志
+
+每个 HTTP 请求都会获得一个唯一 **request_id**（UUID4，形如
+`1b9d6bcd-bbfd-4b2d-9b5d-ab8dfbbd4bed`），用于把客户端报错、服务端日志与
+具体调用关联起来。
+
+### X-Request-ID 响应头
+
+- 服务端对**每个**请求（包括健康检查、正常业务响应、4xx 校验错误、404、500）
+  都在响应头 `X-Request-ID` 中回传该 ID；
+- request_id 在请求入口（ASGI 中间件）生成，并通过 **ContextVar 请求局部
+  上下文**传递给路由、业务校验与异常处理器。每个连接运行在独立任务中、
+  复制独立的 contextvars 上下文，因此并发调用各自持有不同 ID，**互不串号**；
+- 业务代码可用 `app.request_context.get_request_id()` 在任意位置（含同步路由、
+  线程池任务）读取当前请求的 ID 用于附加诊断信息；
+- 当前版本不接受客户端传入的 ID，始终由服务端生成（避免日志注入与碰撞）。
+
+### 统一错误响应格式
+
+三类错误统一为同一种 JSON 结构，HTTP 状态码保持语义不变；**正常业务响应体
+完全不变**（窗口数组、对象或 `null`，见各接口文档）：
+
+| 错误类别 | 状态码 | `code` | 触发场景 |
+| --- | --- | --- | --- |
+| 参数校验错误 | `422` | `validation_error` | Pydantic 字段 / 类型校验失败、JSON 无法解析，以及 `validate_ranges()` 的跨字段业务校验（相位越界、范围超长等） |
+| 业务 / 框架 HTTP 错误 | 原状态码 | 按状态码映射 | 路由不存在（`404 not_found`）、方法不允许（`405 method_not_allowed`），以及代码主动抛出的其他 `HTTPException` |
+| 未捕获异常 | `500` | `internal_error` | 路由内任何未预期异常 |
+
+错误响应体字段：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `request_id` | string | 本请求唯一 ID，与响应头 `X-Request-ID` 完全相同，可据此检索日志 |
+| `code` | string | 稳定的机器可读错误码（见上表；未列入映射表的状态码使用 `http_<状态码>`） |
+| `message` | string | 面向调用方的可读中文信息（单行） |
+| `details` | string[] | 逐条可读明细；参数校验错误时每个元素对应一个不合法字段，业务错误时回传原有 `detail` 内容，500 时为空数组 |
+
+参数校验错误示例（业务跨字段校验，原有中文原因保留在 `details` 中）：
+
+```json
+{
+  "request_id": "3592f408-377d-409d-9d29-c53d23166e09",
+  "code": "validation_error",
+  "message": "请求参数校验失败",
+  "details": ["offset 必须满足 0 <= offset < cycle（路口 cycle=60）"]
+}
+```
+
+字段类型错误示例（明细以 `字段[下标].子字段` 定位开头）：
+
+```json
+{
+  "request_id": "ae1b4bb3-5fbc-4e8a-8534-d5379cd8f125",
+  "code": "validation_error",
+  "message": "请求参数校验失败",
+  "details": ["intersections[0].cycle: 必须是合法的整数"]
+}
+```
+
+路由不存在示例：
+
+```json
+{
+  "request_id": "92f11408-8d6d-4ad7-874c-5be85eeade05",
+  "code": "not_found",
+  "message": "请求的资源不存在",
+  "details": ["Not Found"]
+}
+```
+
+**500 不泄漏内部信息**：未捕获异常的响应体只含固定通用提示，不包含异常类型、
+异常文本或堆栈；完整异常类型、异常文本与堆栈仅写入服务端访问日志（见下节），
+可凭 `request_id` 检索：
+
+```json
+{
+  "request_id": "0c7a6b0c-fb86-4b72-8dfb-00b39d09ea55",
+  "code": "internal_error",
+  "message": "服务器内部错误，请凭 request_id 联系服务提供方排查",
+  "details": []
+}
+```
+
+> 注意：业务上的"无解"（如班次重排无解、终点不可达、放行能力无解）**不是
+> 错误**，状态码仍为 `200`、响应体为 `null` 或空数组，不使用本错误格式。
+
+### 结构化访问日志
+
+每个请求输出**恰好一条** JSON Lines 访问日志（异常路径也不例外），可直接被
+`docker logs`、ELK、Loki 等采集。字段如下：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `timestamp` | string | 日志时刻，UTC ISO 8601（毫秒，`Z` 结尾） |
+| `level` | string | `info`（1xx/2xx/3xx/4xx）或 `error`（5xx） |
+| `logger` | string | 固定为 `greenwave.access` |
+| `message` | string | `request completed`；未捕获异常时为 `request failed with unhandled exception` |
+| `request_id` | string | 与响应头一致的请求 ID |
+| `method` | string | HTTP 方法（`GET` / `POST` / …） |
+| `path` | string | 请求路径（不含 query string） |
+| `status_code` | int | 最终响应状态码（异常兜底为 `500`） |
+| `duration_ms` | number | 请求耗时（毫秒，浮点，3 位小数） |
+| `error_type` | string? | 仅 500：未捕获异常的类型名（如 `RuntimeError`） |
+| `error_message` | string? | 仅 500：未捕获异常文本（仅日志可见，不回传客户端） |
+| `traceback` | string? | 仅 500：完整异常堆栈（仅日志可见，不回传客户端） |
+
+正常请求与校验错误示例：
+
+```json
+{"timestamp": "2026-09-26T01:05:12.316Z", "level": "info", "logger": "greenwave.access", "message": "request completed", "request_id": "87bd2c58-053a-477d-9092-480f197e924c", "method": "POST", "path": "/api/green-wave/windows", "status_code": 200, "duration_ms": 3.729}
+```
+
+```json
+{"timestamp": "2026-09-26T01:06:15.419Z", "level": "error", "logger": "greenwave.access", "message": "request failed with unhandled exception", "request_id": "b6dd82e6-67f8-4722-bfbf-cc8dcd3aa472", "method": "GET", "path": "/boom", "status_code": 500, "duration_ms": 1.681, "error_type": "RuntimeError", "error_message": "...", "traceback": "Traceback (most recent call last): ..."}
+```
+
+访问日志输出到标准输出，级别由 `LOG_LEVEL`（兼容容器的 `UVICORN_LOG_LEVEL`）
+控制；logger 名为 `greenwave.access`。容器启动命令带 `--no-access-log`，
+因此每个请求只有这一条结构化访问记录（uvicorn 的启动与错误日志照常输出）。
+排查问题时，先从客户端响应头或错误体拿到 `request_id`，再用它在日志中
+检索对应条目即可定位完整堆栈。
+
 ## 输入校验与错误
+
+> **错误响应的统一外层格式**（`request_id` / `code` / `message` / `details`
+> 字段、`X-Request-ID` 响应头与访问日志）见上一节
+> [请求 ID、统一错误响应与访问日志](#请求-id统一错误响应与访问日志)。
+> 本节下方示例中的
+>
+> ```json
+> { "detail": ["……"] }
+> ```
+>
+> 仅示意各接口**中文校验原因**；实际响应中这些原因位于统一错误体的
+> `details` 数组内，`code` 为 `validation_error`、状态码仍为 `422`，例如：
+>
+> ```json
+> {"request_id": "…", "code": "validation_error", "message": "请求参数校验失败",
+>  "details": ["travel_max 不得小于 travel（路口 中山路）"]}
+> ```
 
 无效周期、相位偏移、绿灯端点、行驶时间（含 `travel_max < travel` 或
 `travel_max > 86400`），或路口数、发车范围长度越界时返回
@@ -1810,9 +1957,14 @@ deadline 合法但绿灯容量不足（含范围内全程红灯）属于业务�
 ## 运行测试
 
 ```bash
-pip install pytest
+pip install -r requirements-dev.txt   # 含 pytest 与 httpx（TestClient 依赖）
 pytest -q
 ```
+
+除算法对照与 422 校验外，测试还覆盖请求级故障关联：每次请求的唯一
+`X-Request-ID` 响应头、三类错误（参数校验 / 业务 HTTP / 未捕获异常）的统一
+错误体、500 不泄漏内部异常文本、异常路径的访问日志与响应头，以及 40 个并发
+请求下 request_id 与日志记录的一一对应（ContextVar 互不串号）。
 
 测试包含边界场景（跨零点、偏移、范围边界、半开端点不含、无解、行驶时间波动
 `travel_max`）以及 400 组随机参数下与逐秒判定参考实现的逐项对照；最大覆盖另有

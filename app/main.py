@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from fastapi import FastAPI
 
+from .errors import register_exception_handlers
 from .greenwave import (
     compute_conflict_audit,
     compute_convoy_starts,
@@ -17,6 +18,7 @@ from .greenwave import (
     compute_windows,
     offset_diagnostics,
 )
+from .middleware import RequestContextMiddleware, configure_access_logging
 from .schemas import (
     ConflictAuditRequest,
     ConflictAuditResponse,
@@ -116,8 +118,16 @@ app = FastAPI(
         "与跨零点区间，两股都已红灯的尾部交叠不计），逐对返回按时间升序"
         "合并的全部极大半开危险区间，安全的车流对返回空数组。"
     ),
-    version="1.10.0",
+    version="1.11.0",
 )
+
+# 请求级故障关联：每个请求注入唯一 request_id（X-Request-ID 回传）、
+# 结构化访问日志与未捕获异常的统一 500 兜底；纯 ASGI 中间件位于框架
+# ExceptionMiddleware 之外，保证异常路径也有响应头与日志。
+configure_access_logging()
+app.add_middleware(RequestContextMiddleware)
+# 参数校验错误与业务 HTTP 错误统一为含 request_id / code / message 的 JSON。
+register_exception_handlers(app)
 
 
 def _intersection_payload(item) -> dict:
